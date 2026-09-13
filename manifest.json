@@ -5,7 +5,7 @@
     "optional": [],
     "js": "index.js",
     "author": "ymf2317-tech",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "homePage": "https://github.com/ymf2317-tech/SillyTavern-MiMoTTS",
     "hooks": {
         "activate": "init"
