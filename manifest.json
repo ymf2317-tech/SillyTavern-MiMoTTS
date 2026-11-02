@@ -1,11 +1,11 @@
 {
-    "display_name": "MiMo TTS (Xiaomi)",
+    "display_name": "MiMo TTS",
     "loading_order": 50,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "author": "ymf2317-tech",
-    "version": "0.2.0",
+    "version": "2.0.0",
     "homePage": "https://github.com/ymf2317-tech/SillyTavern-MiMoTTS",
     "hooks": {
         "activate": "init"
