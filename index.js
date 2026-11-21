@@ -29,7 +29,7 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.0';
+const VERSION = '2.0.1';
 const PROVIDER_NAME = 'MiMo';
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
@@ -997,20 +997,32 @@ export class MiMoTtsProvider {
         return this.postJson(payload, signal);
     }
 
-    /** 统一发请求：带 api-key，并把浏览器那句没用的 "Failed to fetch" 翻译成人话 */
+    /** 统一发请求：带 api-key，通过同源隐藏 iframe 取原生 fetch 绕过主页面脚本对 /chat/completions 的拦截 */
     postJson(payload, signal) {
         const key = String(this.settings.api_key || '').trim();
         if (!key) {
             throw new Error('请先在 MiMo 供应商设置里填写 API Key');
         }
 
-        return fetch(MIMO_ENDPOINT, {
+        const clean = getCleanFetch();
+        let innerSignal = signal;
+        if (signal && clean.AbortController && clean.AbortController !== globalThis.AbortController) {
+            const innerController = new clean.AbortController();
+            if (signal.aborted) {
+                innerController.abort();
+            } else {
+                signal.addEventListener('abort', () => innerController.abort(), { once: true });
+            }
+            innerSignal = innerController.signal;
+        }
+
+        return clean.fetch(MIMO_ENDPOINT, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'api-key': key,
             },
-            signal,
+            signal: innerSignal,
             body: JSON.stringify(payload),
         }).catch(error => {
             if (isAbortError(error)) {
@@ -1044,6 +1056,44 @@ function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[ch]));
+}
+
+let cachedCleanFetch = null;
+
+function getCleanFetch() {
+    if (cachedCleanFetch) {
+        return cachedCleanFetch;
+    }
+    try {
+        if (typeof document !== 'undefined') {
+            const parent = document.body || document.documentElement;
+            if (parent) {
+                let frame = document.getElementById('__mimo_clean_fetch_frame');
+                if (!frame) {
+                    frame = document.createElement('iframe');
+                    frame.id = '__mimo_clean_fetch_frame';
+                    frame.style.display = 'none';
+                    frame.setAttribute('aria-hidden', 'true');
+                    parent.appendChild(frame);
+                }
+                const win = frame.contentWindow;
+                if (win && typeof win.fetch === 'function') {
+                    cachedCleanFetch = {
+                        fetch: win.fetch.bind(win),
+                        AbortController: win.AbortController || globalThis.AbortController,
+                    };
+                    return cachedCleanFetch;
+                }
+            }
+        }
+    } catch {
+        /* 兜底回退到全局 fetch */
+    }
+    cachedCleanFetch = {
+        fetch: fetch.bind(globalThis),
+        AbortController: globalThis.AbortController,
+    };
+    return cachedCleanFetch;
 }
 
 function escapeAttr(value) {
