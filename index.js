@@ -29,7 +29,7 @@
 import { getRequestHeaders, eventSource, event_types } from '../../../../script.js';
 import { registerTtsProvider, saveTtsProviderSettings } from '../../tts/index.js';
 
-const VERSION = '2.0.1';
+const VERSION = '2.0.2';
 const PROVIDER_NAME = 'MiMo';
 const MIMO_ENDPOINT = 'https://api.xiaomimimo.com/v1/chat/completions';
 const ST_RELAY_ROUTE = '/api/openai/custom/generate-voice';
@@ -743,6 +743,8 @@ export class MiMoTtsProvider {
             return this.fetchCloneBytes(text, voiceId, signal);
         }
 
+        const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
         if (this.settings.mode === 'relay') {
             const endpoint = String(this.settings.relay_endpoint || '').trim();
             if (!endpoint) {
@@ -768,6 +770,15 @@ export class MiMoTtsProvider {
             if (buf.byteLength === 0) {
                 throw new Error('中转返回了空音频，请检查服务器上的代理是否在运行');
             }
+            reportUsageToOmni({
+                url: endpoint || ST_RELAY_ROUTE,
+                model: this.settings.model || MODEL_PRESET,
+                category: 'tts',
+                caller: '语音合成(MiMo中转)',
+                input_text: text,
+                duration_ms: Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime),
+                is_stream: false,
+            });
             return {
                 bytes: new Uint8Array(buf),
                 contentType: response.headers.get('Content-Type') || 'audio/mpeg',
@@ -799,6 +810,16 @@ export class MiMoTtsProvider {
         if (bytes.length === 0) {
             throw new Error('MiMo 返回的音频数据为空，请检查模型名与音色是否正确');
         }
+        reportUsageToOmni({
+            url: MIMO_ENDPOINT,
+            model: json?.model || this.settings.model || MODEL_PRESET,
+            category: 'tts',
+            caller: '语音合成(MiMo)',
+            usage: json?.usage || null,
+            input_text: text,
+            duration_ms: Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime),
+            is_stream: false,
+        });
         return { bytes, contentType: 'audio/mpeg' };
     }
 
@@ -835,6 +856,7 @@ export class MiMoTtsProvider {
             },
         };
 
+        const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         let response = await this.postJson(payload, signal);
         if (!response.ok && response.status >= 500) {
             console.warn(`[MiMo TTS] 克隆合成返回 ${response.status}，1 秒后重试一次`);
@@ -856,6 +878,16 @@ export class MiMoTtsProvider {
         if (bytes.length === 0) {
             throw new Error('克隆合成返回的音频为空，请换一段更清晰的参考音频再试');
         }
+        reportUsageToOmni({
+            url: MIMO_ENDPOINT,
+            model: json?.model || MODEL_CLONE,
+            category: 'tts',
+            caller: '语音克隆(MiMo)',
+            usage: json?.usage || null,
+            input_text: text,
+            duration_ms: Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime),
+            is_stream: false,
+        });
         return { bytes, contentType: 'audio/mpeg' };
     }
 
@@ -865,6 +897,7 @@ export class MiMoTtsProvider {
      * 注意：块与块之间仍会有 0.3~0.5 秒间断，这是酒馆播放器决定的。
      */
     async *chunkedTts(text, voiceId, signal) {
+        const startTime = (typeof performance !== 'undefined' ? performance.now() : Date.now());
         let response;
         try {
             response = await this.postDirect(text, voiceId, true, 'pcm16', signal);
@@ -882,11 +915,14 @@ export class MiMoTtsProvider {
         const threshold = Math.max(48000, Number(this.settings.chunk_seconds || 8) * BYTES_PER_SECOND);
         let pending = [];
         let pendingBytes = 0;
+        let totalAudioBytes = 0;
+        const streamMeta = { usage: null, model: '' };
 
         try {
-            for await (const bytes of this.readSseAudio(response)) {
+            for await (const bytes of this.readSseAudio(response, streamMeta)) {
                 pending.push(bytes);
                 pendingBytes += bytes.length;
+                totalAudioBytes += bytes.length;
                 if (pendingBytes >= threshold) {
                     const wav = this.takeWavChunk(pending);
                     pending = [];
@@ -900,6 +936,19 @@ export class MiMoTtsProvider {
                 return;
             }
             throw error;
+        } finally {
+            if (totalAudioBytes > 0 || streamMeta.usage) {
+                reportUsageToOmni({
+                    url: MIMO_ENDPOINT,
+                    model: streamMeta.model || this.settings.model || MODEL_PRESET,
+                    category: 'tts',
+                    caller: '语音合成(MiMo流式)',
+                    usage: streamMeta.usage || null,
+                    input_text: text,
+                    duration_ms: Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - startTime),
+                    is_stream: true,
+                });
+            }
         }
 
         if (pendingBytes > 0) {
@@ -924,7 +973,7 @@ export class MiMoTtsProvider {
      * 解析 MiMo 的 SSE 流，逐段吐出原始音频字节。
      * 注意：网络分片可能把一行切断，所以要留残余缓冲。
      */
-    async *readSseAudio(response) {
+    async *readSseAudio(response, streamMeta = null) {
         if (!response.body) {
             throw new Error('当前环境不支持流式读取（response.body 为空）');
         }
@@ -959,6 +1008,15 @@ export class MiMoTtsProvider {
                         json = JSON.parse(payload);
                     } catch {
                         continue;
+                    }
+
+                    if (streamMeta) {
+                        if (typeof json?.model === 'string' && json.model.trim()) {
+                            streamMeta.model = json.model.trim();
+                        }
+                        if (json?.usage && typeof json.usage === 'object') {
+                            streamMeta.usage = json.usage;
+                        }
                     }
 
                     const b64 = json?.choices?.[0]?.delta?.audio?.data;
@@ -1056,6 +1114,18 @@ function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, ch => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[ch]));
+}
+
+/** 通过自定义事件向 OmniTracker 上报用量（避免被隐藏 iframe fetch 绕过；未装 OmniTracker 时无副作用） */
+function reportUsageToOmni(detail) {
+    try {
+        if (typeof window === 'undefined' || typeof CustomEvent === 'undefined') {
+            return;
+        }
+        window.dispatchEvent(new CustomEvent('omni-tracker:record', { detail }));
+    } catch {
+        /* ignore */
+    }
 }
 
 let cachedCleanFetch = null;
